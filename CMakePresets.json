@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "llvm-mos/Debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/llvm-mos/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LLVM_MOS_PLATFORM": "rp6502"
+      }
+    },
+    {
+      "name": "llvm-mos/Release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/llvm-mos/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LLVM_MOS_PLATFORM": "rp6502"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "llvm-mos/Debug", "configurePreset": "llvm-mos/Debug" },
+    { "name": "llvm-mos/Release", "configurePreset": "llvm-mos/Release" }
+  ]
+}
