@@ -11,6 +11,7 @@ rp6502_asset(digdug XRAM(XRAM_SPRITE_IMAGES) assets/sprites.bin)
 rp6502_executable(digdug DATA default RESET default)
 rp6502_web(digdug CONFIG [[
     title: 'Dig Dug',
+    overlay: '',
     footer: 'Arrows or WASD to move, Space to pump, Enter to start, P to pause, M to mute.',
 ]])
 target_sources(digdug PRIVATE
