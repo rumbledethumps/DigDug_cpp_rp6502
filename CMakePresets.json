@@ -1,35 +1,53 @@
 {
-  "version": 3,
-  "configurePresets": [
-    {
-      "name": "base",
-      "hidden": true,
-      "generator": "Ninja",
-      "cacheVariables": {
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
-      }
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 21,
+        "patch": 0
     },
-    {
-      "name": "llvm-mos/Debug",
-      "inherits": "base",
-      "binaryDir": "${sourceDir}/build/llvm-mos/debug",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "LLVM_MOS_PLATFORM": "rp6502"
-      }
-    },
-    {
-      "name": "llvm-mos/Release",
-      "inherits": "base",
-      "binaryDir": "${sourceDir}/build/llvm-mos/release",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "LLVM_MOS_PLATFORM": "rp6502"
-      }
-    }
-  ],
-  "buildPresets": [
-    { "name": "llvm-mos/Debug", "configurePreset": "llvm-mos/Debug" },
-    { "name": "llvm-mos/Release", "configurePreset": "llvm-mos/Release" }
-  ]
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "llvm-mos/Debug",
+            "displayName": "llvm-mos/Debug",
+            "description": "llvm-mos, with debug information",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build/llvm-mos/debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "LLVM_MOS_PLATFORM": "rp6502"
+            }
+        },
+        {
+            "name": "llvm-mos/Release",
+            "displayName": "llvm-mos/Release",
+            "description": "llvm-mos, optimized",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build/llvm-mos/release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "LLVM_MOS_PLATFORM": "rp6502"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "llvm-mos/Debug",
+            "displayName": "llvm-mos/Debug",
+            "configurePreset": "llvm-mos/Debug",
+            "targets": ["all"]
+        },
+        {
+            "name": "llvm-mos/Release",
+            "displayName": "llvm-mos/Release",
+            "configurePreset": "llvm-mos/Release",
+            "targets": ["all"]
+        }
+    ]
 }

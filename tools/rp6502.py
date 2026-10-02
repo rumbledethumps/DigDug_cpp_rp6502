@@ -11,6 +11,7 @@ import os
 import re
 import time
 import binascii
+import codecs
 import argparse
 import configparser
 import platform
@@ -20,7 +21,6 @@ import ctypes
 import json
 import glob
 import shlex
-import shutil
 import socket
 import subprocess
 from typing import Union
@@ -584,15 +584,7 @@ class Console:
         return self._code_page
 
     def quote(self, s: str) -> str:
-        """Quote a name/arg for the monitor parser (LOAD/UPLOAD/CD).
-
-        The monitor stores the decoded bytes verbatim as an OEM code-page
-        filename (FatFs FF_LFN_UNICODE=0), so encode to the device code page,
-        not UTF-8; the parser decodes \\NNN octal, so non-printable and high
-        bytes ride as octal to keep the wire ASCII-clean. Pure-ASCII strings
-        encode the same under every code page, so skip the `set cp` round-trip.
-        Characters absent from the code page become '?'.
-        """
+        """Quote a name/arg for the monitor parser (LOAD/UPLOAD/CD)."""
         encoding = "ascii" if s.isascii() else self.code_page()
         try:
             raw = s.encode(encoding, "replace")
@@ -620,35 +612,45 @@ class Console:
 
     def term_posix(self, cp: str):
         """POSIX terminal emulator for Linux, BSD, MacOS, etc."""
-        tty.setraw(sys.stdin.fileno())
-        ctrl_a_pressed = False
-        while True:
-            ready, _, _ = select.select([sys.stdin, self.serial], [], [], None)
-            if sys.stdin in ready:
-                char = os.read(sys.stdin.fileno(), 1).decode("utf-8", errors="ignore")
-                if char == "\x01":  # CTRL-A
-                    ctrl_a_pressed = True
-                    self.serial.write(char.encode(cp))
-                elif ctrl_a_pressed and char.lower() in "bf":
-                    self.send_break()  # eats prompt
-                    sys.stdout.write("\r\n]")  # fake prompt
-                    ctrl_a_pressed = False
-                elif ctrl_a_pressed and char.lower() in "xq":
-                    sys.stdout.write("\r\n")
-                    if sys.stdin.isatty():
-                        os.system("stty sane")
-                    break
-                else:
-                    ctrl_a_pressed = False
-                    self.serial.write(char.encode(cp))
-            if self.serial in ready:
-                data = self.serial.read(1)
-                if len(data) > 0:
-                    try:
-                        sys.stdout.write(data.decode(cp))
-                    except UnicodeDecodeError:
-                        sys.stdout.write(f"\\x{data[0]:02x}")
-                    sys.stdout.flush()
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd) if sys.stdin.isatty() else None
+        if saved:
+            tty.setraw(fd)
+        # A keystroke arrives a byte at a time and only a whole character can
+        # be spelled in the device code page.
+        decoder = codecs.getincrementaldecoder("utf-8")("ignore")
+        try:
+            ctrl_a_pressed = False
+            while True:
+                ready, _, _ = select.select([sys.stdin, self.serial], [], [], None)
+                if sys.stdin in ready:
+                    char = decoder.decode(os.read(fd, 1))
+                    if not char:
+                        continue  # a character still arriving
+                    if char == "\x01":  # CTRL-A
+                        ctrl_a_pressed = True
+                        self.serial.write(char.encode(cp, "replace"))
+                    elif ctrl_a_pressed and char.lower() in "bf":
+                        self.send_break()  # eats prompt
+                        sys.stdout.write("\r\n]")  # fake prompt
+                        ctrl_a_pressed = False
+                    elif ctrl_a_pressed and char.lower() in "xq":
+                        sys.stdout.write("\r\n")
+                        break
+                    else:
+                        ctrl_a_pressed = False
+                        self.serial.write(char.encode(cp, "replace"))
+                if self.serial in ready:
+                    data = self.serial.read(1)
+                    if len(data) > 0:
+                        try:
+                            sys.stdout.write(data.decode(cp))
+                        except UnicodeDecodeError:
+                            sys.stdout.write(f"\\x{data[0]:02x}")
+                        sys.stdout.flush()
+        finally:
+            if saved:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
     def term_windows(self, cp):
         """Windows terminal emulator using Console API"""
@@ -667,7 +669,7 @@ class Console:
                     if key_in:
                         if key_in == "\x01":  # CTRL-A
                             ctrl_a_pressed = True
-                            self.serial.write(key_in.encode(cp))
+                            self.serial.write(key_in.encode(cp, "replace"))
                         elif ctrl_a_pressed and key_in.lower() in "bf":
                             self.send_break()  # eats prompt
                             sys.stdout.write("\r\n]")  # fake prompt
@@ -677,7 +679,7 @@ class Console:
                             break
                         else:
                             ctrl_a_pressed = False
-                            self.serial.write(key_in.encode(cp))
+                            self.serial.write(key_in.encode(cp, "replace"))
                     else:
                         time.sleep(0.001)
             except KeyboardInterrupt:
@@ -921,16 +923,21 @@ class ROM:
             raise ValueError(f"Invalid hex address: {s!r}")
         return int(s, 0)
 
-    def __init__(self):
+    def __init__(self, replace=()):
         """Sparse array of virtual ROM with optional named assets."""
         self.data = {}
         self.alloc = {}
         self.assets = []  # list of (name, bytes)
+        self.replace = set(replace)
 
     def add_asset(self, name: str, data: bytes):
         """Append a named asset to the ROM."""
-        if any(n == name for n, _ in self.assets):
-            raise ROMException(f"Asset name already exists: {name}")
+        for i, (n, _) in enumerate(self.assets):
+            if n == name:
+                if name not in self.replace:
+                    raise ROMException(f"Asset name already exists: {name}")
+                self.assets[i] = (name, data)
+                return
         self.assets.append((name, data))
 
     def add_binary_data(self, data: bytes, addr: int):
@@ -983,21 +990,21 @@ class ROM:
                 raise ROMException("No nmi address found in file.")
             addr["nmi"] = data[0] + data[1] * 256
             data = data[2:]
-        if addr["nmi"]:
+        if addr["nmi"] is not None:
             self.add_nmi_vector(addr["nmi"])
         if addr["reset"] is True:
             if len(data) < 2:
                 raise ROMException("No reset address found in file.")
             addr["reset"] = data[0] + data[1] * 256
             data = data[2:]
-        if addr["reset"]:
+        if addr["reset"] is not None:
             self.add_reset_vector(addr["reset"])
         if addr["irq"] is True:
             if len(data) < 2:
                 raise ROMException("No irq address found in file.")
             addr["irq"] = data[0] + data[1] * 256
             data = data[2:]
-        if addr["irq"]:
+        if addr["irq"] is not None:
             self.add_irq_vector(addr["irq"])
         self.add_binary_data(data, addr["data"])
 
@@ -1032,7 +1039,7 @@ class ROM:
             # Decode first line as cp850 because binary garbage can
             # raise here before our better message gets to the user.
             command = f.readline().decode("cp850")
-            if not re.match(f"^#!{SCRIPT_NAME}\\r?\\n$", command, re.IGNORECASE):
+            if not re.match(f"^#!.*{SCRIPT_NAME}", command, re.IGNORECASE):
                 raise ROMException(f"Invalid ROM file: {file}")
             while True:
                 line = f.readline()
@@ -1133,26 +1140,52 @@ class Emulator:
     launching = False
 
     @staticmethod
-    def find():
-        """The emulator the tools fetched beside this script, or a bare name.
-
-        A full path is one that is there. A bare name is left for PATH to
-        resolve at launch, which is all there is to go on when the tools
-        fetch could not get an emulator for this machine.
-        """
+    def find(config=None):
+        """The emulator the tools fetch beside this script."""
         exe = "rp6502-emu.exe" if platform.system() == "Windows" else "rp6502-emu"
         beside = "rp6502-emu.exe" if "microsoft" in platform.release().lower() else exe
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), beside)
-        return path if os.path.isfile(path) else exe
+        if config:
+            try:
+                rel = os.path.relpath(path, os.path.dirname(os.path.abspath(config)))
+            except ValueError:  # Windows: another drive has no relative path
+                return path
+            if not rel.startswith(os.pardir):
+                return rel.replace(os.sep, "/")
+        return path
+
+    @staticmethod
+    def resolve(emulator: str, config) -> str:
+        """The executable an 'emulator' setting names."""
+        if not emulator:
+            where = f" in {config}" if config else " in a config file"
+            raise RuntimeError(
+                f"No emulator configured — set 'emulator'{where} "
+                f"to the rp6502-emu executable path."
+            )
+        emulator = os.path.expanduser(os.path.expandvars(emulator))
+        if config and not os.path.isabs(emulator):
+            beside = os.path.join(os.path.dirname(os.path.abspath(config)), emulator)
+            if os.path.isfile(beside):
+                return beside
+        return emulator
+
+    @staticmethod
+    def cannot_run(emulator: str, config, err) -> str:
+        """Why the emulator did not start, and where to change it."""
+        if config:
+            return (
+                f"Cannot run emulator '{emulator}': {err} — "
+                f"fix 'emulator' in {config}"
+            )
+        return (
+            f"Cannot run emulator '{emulator}': {err} — "
+            f"name it with 'emulator' in a config file, or put it on PATH"
+        )
 
     @staticmethod
     def send_dap_error(message: str):
-        """Speak minimal DAP: acknowledge `initialize`, then fail `launch`/`attach`.
-
-        Reads Content-Length framed messages from our stdin (the DAP request
-        stream) and writes responses to stdout. VSCode shows the message from a
-        failed launch/attach response in an error dialog.
-        """
+        """Speak minimal DAP: acknowledge `initialize`, then fail `launch`/`attach`."""
         stdin = sys.stdin.buffer
         stdout = sys.stdout.buffer
         out_seq = 0
@@ -1223,6 +1256,85 @@ class Emulator:
             send(response)
 
 
+def serve_web(path):
+    """Serves the web packages that rp6502_web() makes in <build>/web, with
+    a list of them at the root, until stopped. path is the build folder or
+    a file in it, such as the launch target that VS Code has just built."""
+    import html
+    import http.server
+    import threading
+    import webbrowser
+
+    build = os.path.abspath(path)
+    while not os.path.isfile(os.path.join(build, "CMakeCache.txt")):
+        parent = os.path.dirname(build)
+        if parent == build:
+            raise RuntimeError(f"{path} is not in a CMake build folder")
+        build = parent
+    root = os.path.join(build, "web")
+
+    def packages():
+        if not os.path.isdir(root):
+            return []
+        return sorted(
+            name
+            for name in os.listdir(root)
+            if os.path.isfile(os.path.join(root, name, "index.html"))
+        )
+
+    if not packages():
+        raise RuntimeError(
+            f"{build} has no web packages; rp6502_web() in CMakeLists.txt makes them"
+        )
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=root, **kwargs)
+
+        def do_GET(self):
+            if self.path.split("?")[0] not in ("/", "/index.html"):
+                return super().do_GET()
+            items = "".join(
+                f'<li><a href="{html.escape(name)}/">{html.escape(name)}</a>'
+                f' &middot; <a href="{html.escape(name)}.zip">{html.escape(name)}.zip</a></li>'
+                for name in packages()
+            )
+            body = (
+                '<!doctype html><meta charset="utf-8"><title>Web packages</title>'
+                f"<h1>Web packages</h1><ul>{items}</ul>"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    # On Windows, SO_REUSEADDR lets a second server bind a port in use.
+    class Server(http.server.ThreadingHTTPServer):
+        allow_reuse_address = os.name != "nt"
+
+    server = None
+    for port in range(8000, 8100):
+        try:
+            server = Server(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            continue
+    if not server:
+        raise RuntimeError("No free port from 8000 to 8099")
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    print(f"[{SCRIPT_FILE}] Serving {root} at {url}", flush=True)
+    # A text browser waits for the page, which is served only after this.
+    threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 def exec_args():
     # Standard library argument parser
     class CustomFormatter(argparse.HelpFormatter):
@@ -1237,9 +1349,11 @@ def exec_args():
     cmds = {
         "term": ("Attach to the RIA console.", None),
         "emu": ("Launch emulator from config (for IDE).", None),
+        "execute": ("Run local ROM in the emulator with no window, headless or by --script.", 1),
         "run": ("Run local ROM by sending to RIA.", 1),
         "upload": ("Upload local files to RIA USB storage.", "+"),
         "basic": ("Executes a program with the installed BASIC.", 1),
+        "web": ("Serve the web packages of a build folder.", None),
         "create": (
             "Create local ROM file from a file. Additional local ROM files will be merged.",
             "+",
@@ -1254,13 +1368,40 @@ def exec_args():
                 nargs=nargs,
                 help="Local filename." if nargs == 1 else "Local filename(s).",
             )
-    # Everything after the ROM filename is the ROM's argv, like `LOAD rom args...`.
-    parsers["run"].add_argument(
-        "rom_args",
-        nargs=argparse.REMAINDER,
-        metavar="args",
-        help="Arguments passed to the ROM.",
+    parsers["web"].add_argument(
+        "filename", nargs=1, metavar="build", help="CMake build folder, or a file in it."
     )
+    parsers["create"].add_argument(
+        "--replace",
+        action="append",
+        default=[],
+        metavar="name",
+        help="A later asset of this name replaces an earlier one. Repeatable.",
+    )
+    parsers["execute"].add_argument(
+        "--script", metavar="file", help="Drive the ROM with an emulator script."
+    )
+    parsers["execute"].add_argument(
+        "--seed", metavar="n", help="Fixed random seed, for a reproducible run."
+    )
+    parsers["execute"].add_argument(
+        "--phi2",
+        metavar="khz",
+        help="6502 clock in kHz. Without --script the default is 0, unpaced.",
+    )
+    parsers["execute"].add_argument(
+        "--save-dir",
+        metavar="folder",
+        help="Folder used as SAVE:, instead of the OS folder for saved data.",
+    )
+    # Everything after the ROM filename is the ROM's argv, like `LOAD rom args...`.
+    for cmd in ("run", "execute"):
+        parsers[cmd].add_argument(
+            "rom_args",
+            nargs=argparse.REMAINDER,
+            metavar="args",
+            help="Arguments passed to the ROM.",
+        )
     parser.add_argument(
         "-a",
         "--address",
@@ -1364,7 +1505,7 @@ def exec_args():
                 config.remove_section(SCRIPT_NAME)  # drop legacy [RP6502]
                 # User always sees the full list of keys, even when blank.
                 config[launch] = {
-                    "emulator": pick("emulator") or Emulator.find(),
+                    "emulator": pick("emulator") or Emulator.find(args.config),
                     "device": pick("device") or args.device,
                     "key": pick("key") or args.key or "",
                     "workdir": pick("workdir") or args.workdir or "",
@@ -1519,7 +1660,7 @@ def exec_args():
         args.reset = str_to_address(parser, args.reset, "-r/--reset")
         args.irq = str_to_address(parser, args.irq, "-i/--irq")
         print(f"[{os.path.basename(__file__)}] Creating {args.out}")
-        rom = ROM()
+        rom = ROM(args.replace)
         if args.address is None:
             for vec_value, vec_flag in (
                 (args.nmi, "-n/--nmi"),
@@ -1530,11 +1671,11 @@ def exec_args():
                     parser.error(
                         f"argument {vec_flag}: 'file' requires a binary asset (-a)"
                     )
-            if args.nmi:
+            if args.nmi is not None:
                 rom.add_nmi_vector(args.nmi)
-            if args.reset:
+            if args.reset is not None:
                 rom.add_reset_vector(args.reset)
-            if args.irq:
+            if args.irq is not None:
                 rom.add_irq_vector(args.irq)
             extras_start = 0
         else:
@@ -1566,35 +1707,7 @@ def exec_args():
             raise RuntimeError(
                 "emu requires -c/--config <file> with an 'emulator' path."
             )
-        config_hint = f" in {args.config}"
-        emulator = getattr(args, "emulator", "")
-        if not emulator:
-            raise RuntimeError(
-                f"No emulator configured — set 'emulator'{config_hint} "
-                f"to the rp6502-emu executable path."
-            )
-        emulator = os.path.expanduser(os.path.expandvars(emulator))
-        # A macOS .app is a directory; run its inner executable.
-        if platform.system() == "Darwin" and emulator.rstrip("/").endswith(".app"):
-            emulator = os.path.join(
-                emulator.rstrip("/"), "Contents", "MacOS", "rp6502-emu"
-            )
-        # An explicit path (with a separator) must exist; a bare name is resolved
-        # against PATH so we can report "not found on PATH" precisely (rather than
-        # a misleading errno from execvp on non-executable PATH entries).
-        has_sep = os.sep in emulator or (os.altsep and os.altsep in emulator)
-        if has_sep:
-            if not os.path.isfile(emulator):
-                raise FileNotFoundError(
-                    f"Emulator '{emulator}' not found — fix 'emulator'{config_hint}."
-                )
-        else:
-            resolved = shutil.which(emulator)
-            if resolved is None:
-                raise FileNotFoundError(
-                    f"Emulator '{emulator}' not found on PATH — fix 'emulator'{config_hint}."
-                )
-            emulator = resolved
+        emulator = Emulator.resolve(getattr(args, "emulator", ""), args.config)
         cmd = [emulator, "--dap", "--ini", args.config]
         # Config args ride the emulator command line as the ROM's argv;
         # a launch request that carries its own args overrides them there.
@@ -1605,11 +1718,46 @@ def exec_args():
         print(f"[{SCRIPT_FILE}] Launching {emulator}", file=sys.stderr)
         try:
             if os.name == "nt":
-                sys.exit(subprocess.Popen(cmd).wait())
+                sys.exit(
+                    subprocess.Popen(
+                        cmd, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr
+                    ).wait()
+                )
             os.execvp(cmd[0], cmd)
         except OSError as e:
-            # Backstop for exec failures on a path shutil.which deemed runnable.
-            raise RuntimeError(f"Cannot run emulator '{emulator}'{config_hint}: {e}")
+            raise RuntimeError(Emulator.cannot_run(emulator, args.config, e))
+
+    if args.command == "web":
+        serve_web(args.filename[0])
+
+    if args.command == "execute":
+        # The exit code of the ROM becomes the exit code of this process, so a
+        # 6502 program can be a step in a pipeline or a test.
+        emulator = Emulator.resolve(getattr(args, "emulator", ""), args.config)
+        if args.script:
+            cmd = [emulator, "--script", args.script]
+        else:
+            cmd = [emulator, "--headless"]
+        phi2 = args.phi2 if args.phi2 is not None else (None if args.script else "0")
+        if phi2 is not None:
+            cmd += ["--phi2", phi2]
+        if args.seed:
+            cmd += ["--seed", args.seed]
+        if args.save_dir:
+            cmd += ["--save-dir", args.save_dir]
+        cmd.append(args.filename[0])
+        rom_args = args.rom_args
+        if rom_args and rom_args[0] == "--":  # REMAINDER keeps a leading "--"
+            rom_args = rom_args[1:]
+        if not rom_args:
+            rom_args = config_rom_args()
+        if rom_args:
+            cmd += ["--"] + rom_args
+        stdin = None if args.script == "-" else subprocess.DEVNULL
+        try:
+            sys.exit(subprocess.run(cmd, stdin=stdin).returncode)
+        except OSError as e:
+            raise RuntimeError(Emulator.cannot_run(emulator, args.config, e))
 
 
 # This file may be included or run like a program.
@@ -1636,6 +1784,7 @@ if __name__ == "__main__":
                 ROMException,
                 FileNotFoundError,
                 TimeoutError,
+                socket.timeout,
                 RuntimeError,
                 ConnectionError,
                 socket.gaierror,

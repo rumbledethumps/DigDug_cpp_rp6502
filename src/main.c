@@ -4,13 +4,14 @@
 //   Arrow keys / WASD  move          Space / Z / Ctrl  pump
 //   Enter              start game    Up/Down           1 or 2 players (title)
 //   Left/Right         easy/normal   P pause   M mute   Escape quit
-//   Gamepad: d-pad / left stick, A/B/X pump, Start to begin.
+//   Gamepad: d-pad / left stick, A/B/X/Y pump, Start to begin.
 #include <rp6502.h>
 #include <stdint.h>
 #include <stdio.h>
 #include "game.h"
 #include "video.h"
 #include "sound.h"
+#include "xram.h"
 
 #define TITLE_TIME (60 * 12)
 
@@ -20,8 +21,8 @@ static uint8_t state = ST_TITLE;
 static uint16_t titleTimer, gameoverTimer;
 static uint8_t numPlayers = 1, bonzo = 0, paused = 0;
 static uint32_t hiscore = 10000;
-static uint8_t kbd[32];
-static uint8_t pad[4];
+static keyboard_t keyboard;
+static gamepad_player_t pad;
 static uint8_t prevKeys;
 static uint8_t rngState = 0x5A;
 static uint8_t titleDrawn;
@@ -31,11 +32,11 @@ uint8_t game_random(void) {
     x ^= (uint8_t)(x << 3);
     x ^= (uint8_t)(x >> 5);
     x ^= (uint8_t)(x << 1);
-    rngState = (uint8_t)(x + RIA.vsync);
+    rngState = (uint8_t)(x + ria_vsync());
     return rngState;
 }
 
-#define KEY(code) (kbd[(code) >> 3] & (1 << ((code) & 7)))
+#define KEY(code) KEYBOARD_PRESSED(keyboard.keys, code)
 #define K_RIGHT 0x4F
 #define K_LEFT 0x50
 #define K_DOWN 0x51
@@ -64,27 +65,24 @@ uint8_t game_random(void) {
 #define E_ESC 128
 
 static void read_input(uint8_t* joy, uint8_t* button, uint8_t* edges) {
-    uint8_t i, now = 0;
+    uint8_t now = 0;
     uint8_t j = 0xFF, b = 0;
-    RIA.addr1 = XR_KBD;
-    RIA.step1 = 1;
-    for (i = 0; i < 32; ++i) kbd[i] = RIA.rw1;
-    RIA.addr1 = XR_PAD;
-    for (i = 0; i < 4; ++i) pad[i] = RIA.rw1;
+    xram0_read(&keyboard, XRAM_KEYBOARD, sizeof keyboard);
+    xram0_read(&pad, XRAM_GAMEPAD, sizeof pad);
     if (KEY(K_RIGHT) || KEY(K_D)) j &= (uint8_t)~JOY_E;
     if (KEY(K_LEFT) || KEY(K_A)) j &= (uint8_t)~JOY_W;
     if (KEY(K_DOWN) || KEY(K_S)) j &= (uint8_t)~JOY_S;
     if (KEY(K_UP) || KEY(K_W)) j &= (uint8_t)~JOY_N;
     if (KEY(K_SPACE) || KEY(K_Z) || KEY(K_LCTRL) || KEY(K_RCTRL)) b = 1;
-    if (pad[0] & 0x80) {                 // gamepad connected
-        uint8_t d = (uint8_t)(pad[0] | pad[1]);   // d-pad bits or left stick digital
-        if (d & 0x01) j &= (uint8_t)~JOY_N;
-        if (d & 0x02) j &= (uint8_t)~JOY_S;
-        if (d & 0x04) j &= (uint8_t)~JOY_W;
-        if (d & 0x08) j &= (uint8_t)~JOY_E;
-        if (pad[2] & 0x1B) b = 1;        // A B X Y
+    if (pad.dpad & GAMEPAD_FEAT_CONNECTED) {
+        uint8_t d = (uint8_t)(pad.dpad | pad.sticks);   // d-pad bits or left stick digital
+        if (d & GAMEPAD_DPAD_UP) j &= (uint8_t)~JOY_N;
+        if (d & GAMEPAD_DPAD_DOWN) j &= (uint8_t)~JOY_S;
+        if (d & GAMEPAD_DPAD_LEFT) j &= (uint8_t)~JOY_W;
+        if (d & GAMEPAD_DPAD_RIGHT) j &= (uint8_t)~JOY_E;
+        if (pad.btn0 & (GAMEPAD_BTN0_A | GAMEPAD_BTN0_B | GAMEPAD_BTN0_X | GAMEPAD_BTN0_Y)) b = 1;
     }
-    if (KEY(K_ENTER) || (pad[3] & 0x08)) now |= E_ENTER;
+    if (KEY(K_ENTER) || (pad.btn1 & GAMEPAD_BTN1_START)) now |= E_ENTER;
     if (KEY(K_UP)) now |= E_UP;
     if (KEY(K_DOWN)) now |= E_DOWN;
     if (KEY(K_LEFT)) now |= E_LEFT;
@@ -99,6 +97,7 @@ static void read_input(uint8_t* joy, uint8_t* button, uint8_t* edges) {
 }
 
 static void start_game(uint8_t attract) {
+    titleTimer = 0;
     sound_stop();
     game_init(numPlayers, bonzo, attract, 1);
     state = attract ? ST_ATTRACT : ST_PLAY;
@@ -145,8 +144,8 @@ static void show_message(void) {
 int main(void) {
     uint8_t joy, button, edges;
     // enable keyboard and gamepad reporting into XRAM
-    xreg_ria_keyboard(XR_KBD);
-    xreg_ria_gamepad(XR_PAD);
+    xreg_ria_keyboard(XRAM_KEYBOARD);
+    xreg_ria_gamepad(XRAM_GAMEPAD);
     video_init();
     sound_init();
     for (;;) {
@@ -171,7 +170,6 @@ int main(void) {
                 titleDrawn = 0;
                 start_game(0);
             } else if (++titleTimer > TITLE_TIME) {
-                titleTimer = 0;
                 titleDrawn = 0;
                 start_game(1);
             }
@@ -193,7 +191,10 @@ int main(void) {
             continue;
         }
         // playing / game over
-        if (edges & E_P) paused = !paused;
+        if (edges & E_P) {
+            paused = !paused;
+            sound_pause(paused);
+        }
         if (!paused) {
             game_frame(joy, button);
             if (G.score[0] > hiscore) hiscore = G.score[0];
@@ -214,6 +215,6 @@ int main(void) {
         }
     }
     sound_stop();
-    xreg_vga_canvas(0);
+    xreg_vga_canvas(CANVAS_CONSOLE);
     return 0;
 }

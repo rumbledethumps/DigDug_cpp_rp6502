@@ -3,7 +3,6 @@
 #define GFX_DATA_H
 #include <stdint.h>
 
-#define SPRITE_XRAM 0xA000
 #define SPRITE_SLOTS 166
 #define NUM_CHARS 64
 

@@ -1,9 +1,10 @@
 #include "sound.h"
 #include "game.h"
-#include "video.h"
+#include "xram.h"
 #include <rp6502.h>
 
 uint8_t sound_muted;
+static uint8_t sound_paused;
 
 // ------------------------------------------------------------- song data ---
 // byte: bits 0-4 AUDF, bits 5-6 extra repeats, bit 7 rest after the note
@@ -93,17 +94,14 @@ static void initdigs(void) {
 }
 
 void sound_init(void) {
-    uint8_t i;
     cursong = sngtemp1 = 0;
     initalls();
     initdigs();
     audv[0] = audv[1] = 0;
     lastv[0] = lastv[1] = 0xFF;
     // clear the PSG block and enable it
-    RIA.addr0 = XR_PSG;
-    RIA.step0 = 1;
-    for (i = 0; i < 64; ++i) RIA.rw0 = 0;
-    xreg(0, 1, 0x00, XR_PSG);
+    xram0_set(XRAM_PSG, 0, sizeof(psg_t));
+    xreg_ria_psg(XRAM_PSG);
 }
 
 void sound_request(uint8_t song) {
@@ -116,6 +114,11 @@ void sound_stop(void) {
     cursong = 0;
     sngtemp1 = 0;
     audv[0] = audv[1] = 0;
+    psg_write();
+}
+
+void sound_pause(uint8_t on) {
+    sound_paused = on;
     psg_write();
 }
 
@@ -194,36 +197,38 @@ static uint8_t decode(void) {
     return 0;
 }
 
+// TIA volume is linear and PSG attenuation is logarithmic, so each TIA
+// volume takes the attenuation of the nearest PSG level.
+static const uint8_t ATTEN[16] = {15, 13, 11, 9, 7, 6, 5, 4, 3, 3, 2, 1, 1, 1, 0, 0};
+
 // TIA register values -> PSG channel
 static void psg_channel(uint8_t ch) {
-    unsigned addr = XR_PSG + ch * 8;
+    psg_channel_t chan;
     uint8_t c = audc[ch], f = audf[ch], v = audv[ch];
     uint16_t hz3;
-    uint8_t wave = 1;   // square
+    uint8_t wave = PSG_WAVE_SQUARE;
     uint8_t duty = 128;
-    if (sound_muted) v = 0;
+    if (sound_muted || sound_paused) v = 0;
     if (c == lastc[ch] && f == lastf[ch] && v == lastv[ch]) return;
     lastc[ch] = c; lastf[ch] = f; lastv[ch] = v;
     switch (c) {
-        case 4: case 5: hz3 = (uint16_t)(47100UL / (f + 1)); break;             // 31400/2 * 3
-        case 12: case 13: hz3 = (uint16_t)(15700UL / (f + 1)); break;           // 31400/6 * 3
-        case 6: case 10: hz3 = (uint16_t)(3038UL / (f + 1)); break;             // /31
-        case 1: hz3 = (uint16_t)(6280UL / (f + 1)); wave = 4; break;            // 4-bit poly ~ noise
-        case 7: case 9: hz3 = (uint16_t)(3038UL / (f + 1)); wave = 4; break;    // 5-bit poly
-        case 8: hz3 = (uint16_t)(94200UL / (f + 1) / 8); wave = 4; break;       // 9-bit poly
-        case 15: case 3: case 2: hz3 = (uint16_t)(6280UL / (f + 1)); wave = 4; break;
+        case 4: case 5: hz3 = (uint16_t)(47100UL / (f + 1)); break;                       // 31400/2 * 3
+        case 12: case 13: hz3 = (uint16_t)(15700UL / (f + 1)); break;                     // 31400/6 * 3
+        case 6: case 10: hz3 = (uint16_t)(3038UL / (f + 1)); break;                       // /31
+        case 1: hz3 = (uint16_t)(6280UL / (f + 1)); wave = PSG_WAVE_NOISE; break;         // 4-bit poly ~ noise
+        case 7: case 9: hz3 = (uint16_t)(3038UL / (f + 1)); wave = PSG_WAVE_NOISE; break; // 5-bit poly
+        case 8: hz3 = (uint16_t)(94200UL / (f + 1) / 8); wave = PSG_WAVE_NOISE; break;    // 9-bit poly
+        case 15: case 3: case 2: hz3 = (uint16_t)(6280UL / (f + 1)); wave = PSG_WAVE_NOISE; break;
         case 14: hz3 = (uint16_t)(1012UL / (f + 1)); break;
         default: v = 0; hz3 = 0; break;
     }
-    RIA.addr0 = addr;
-    RIA.step0 = 1;
-    RIA.rw0 = (unsigned char)hz3;
-    RIA.rw0 = (unsigned char)(hz3 >> 8);
-    RIA.rw0 = duty;
-    RIA.rw0 = (unsigned char)((v << 4) | 0);      // attack: volume, fastest rate
-    RIA.rw0 = (unsigned char)((v << 4) | 0);      // decay: same volume (sustain)
-    RIA.rw0 = (unsigned char)((wave << 4) | 0);   // waveform, release rate
-    RIA.rw0 = (unsigned char)(v ? 1 : 0);         // pan centre, gate
+    chan.freq = hz3;
+    chan.duty = duty;
+    chan.attack = (uint8_t)(ATTEN[v] << 4);       // attack: volume, fastest rate
+    chan.decay = chan.attack;                     // decay: same volume (sustain)
+    chan.release_wave = wave;                     // waveform, release rate
+    chan.pan_gate = v ? PSG_GATE : 0;             // pan centre, gate
+    xram0_write(XRAM_PSG + ch * sizeof(psg_channel_t), &chan, offsetof(psg_channel_t, reserved));
 }
 
 static void psg_write(void) {

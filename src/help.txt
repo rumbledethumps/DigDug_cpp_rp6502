@@ -1,0 +1,13 @@
+Dig Dug
+
+The Atari 7800 Dig Dug, ported to the Picocomputer 6502.
+
+Move:   Arrows or WASD, or the d-pad or left stick
+Pump:   Space, Z or Ctrl, or A, B, X or Y
+Start:  Enter or Start
+Pause:  P
+Mute:   M
+Quit:   Escape
+
+On the title screen, Up and Down choose 1 or 2 players, and Left and
+Right choose the level: Teddy is easy and Pineapple is normal.

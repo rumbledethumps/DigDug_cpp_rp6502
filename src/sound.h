@@ -7,6 +7,7 @@ void sound_init(void);
 void sound_request(uint8_t song);
 void sound_frame(uint8_t walking, uint8_t fast, uint8_t dying, uint8_t entry, uint8_t nonoise);
 void sound_stop(void);
+void sound_pause(uint8_t on);
 extern uint8_t sound_muted;
 
 #endif

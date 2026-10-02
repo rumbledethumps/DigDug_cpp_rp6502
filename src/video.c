@@ -2,7 +2,9 @@
 #include "game.h"
 #include "gfx_data.h"
 #include "tables.h"
+#include "xram.h"
 #include <rp6502.h>
+#include <string.h>
 
 // bitmap palette indices
 //  0 black, 1..8 dirt layers (dirt, pebble) x 4, 9 sky green, 10 sky blue,
@@ -22,21 +24,11 @@ static uint8_t scoreDirty;
 static uint8_t palDirty;
 static uint8_t blanked;
 
-#define ROWBYTES 160
+static palettes_t palettes;
+static mode5_sprite_t sprites[NUM_SPRITES];
+
+#define ROWBYTES (BITMAP_W / 2u)
 #define TOP_BORDER 24            // (240 - 192) / 2
-
-static void xram_write16(unsigned addr, unsigned v) {
-    RIA.addr0 = addr;
-    RIA.step0 = 1;
-    RIA.rw0 = (unsigned char)v;
-    RIA.rw0 = (unsigned char)(v >> 8);
-}
-
-static void set_palette_entry(unsigned addr, uint8_t colour, uint8_t opaque) {
-    unsigned v = NTSC555[colour];
-    if (!opaque) v = 0;
-    xram_write16(addr, v);
-}
 
 static void build_nibs(void) {
     uint8_t l, v;
@@ -61,40 +53,36 @@ static void build_nibs(void) {
 static void write_palettes(void) {
     uint8_t l, p, c;
     // bitmap palette
-    set_palette_entry(XR_BPAL + 0, 0, 1);
+    palettes.bitmap[0] = NTSC555[0];
     for (l = 0; l < 4; ++l) {
-        set_palette_entry(XR_BPAL + (l * 2 + 1) * 2, DIRTCOLR[G.dirtScheme + l], 1);
-        set_palette_entry(XR_BPAL + (l * 2 + 2) * 2, PEBBCOLR[G.dirtScheme + l], 1);
+        palettes.bitmap[l * 2 + 1] = NTSC555[DIRTCOLR[G.dirtScheme + l]];
+        palettes.bitmap[l * 2 + 2] = NTSC555[PEBBCOLR[G.dirtScheme + l]];
     }
-    set_palette_entry(XR_BPAL + 9 * 2, IPALETTE[7][1], 1);
-    set_palette_entry(XR_BPAL + 10 * 2, IPALETTE[7][2], 1);
-    set_palette_entry(XR_BPAL + 11 * 2, IPALETTE[7][3], 1);
-    set_palette_entry(XR_BPAL + 12 * 2, WHITE, 1);
-    set_palette_entry(XR_BPAL + 13 * 2, IPALETTE[4][1], 1);
-    set_palette_entry(XR_BPAL + 14 * 2, IPALETTE[4][2], 1);
-    set_palette_entry(XR_BPAL + 15 * 2, IPALETTE[4][3], 1);
-    // sprite palettes 0..7 = the 7800 palettes, 8 = vegetables
-    for (p = 0; p < 8; ++p) {
-        set_palette_entry(XR_SPAL + p * 8, 0, 0);
-        for (c = 1; c < 4; ++c) set_palette_entry(XR_SPAL + p * 8 + c * 2, IPALETTE[p][c], 1);
-    }
-    set_palette_entry(XR_SPAL + 8 * 8, 0, 0);
-    for (c = 0; c < 3; ++c) set_palette_entry(XR_SPAL + 8 * 8 + (c + 1) * 2, G.vegcol[c], 1);
+    palettes.bitmap[9] = NTSC555[IPALETTE[7][1]];
+    palettes.bitmap[10] = NTSC555[IPALETTE[7][2]];
+    palettes.bitmap[11] = NTSC555[IPALETTE[7][3]];
+    palettes.bitmap[12] = NTSC555[WHITE];
+    palettes.bitmap[13] = NTSC555[IPALETTE[4][1]];
+    palettes.bitmap[14] = NTSC555[IPALETTE[4][2]];
+    palettes.bitmap[15] = NTSC555[IPALETTE[4][3]];
+    // sprite palettes 0..7 = the 7800 palettes, 8 = vegetables; entry 0 stays transparent
+    for (p = 0; p < 8; ++p)
+        for (c = 1; c < 4; ++c) palettes.sprites[p][c] = NTSC555[IPALETTE[p][c]];
+    for (c = 0; c < 3; ++c) palettes.sprites[8][c + 1] = NTSC555[G.vegcol[c]];
+    xram0_write(XRAM_PALETTES, &palettes, sizeof palettes);
 }
 
 // Draw one 8x12 character (doubled to 16x12) at bitmap pixel (x, y).
 static void draw_char(uint8_t ch, unsigned x, unsigned y, const uint8_t* nib) {
     uint8_t k = CHARMAP[ch];
     const uint8_t* rows;
-    unsigned addr = y * ROWBYTES + (x >> 1);
+    unsigned addr = XRAM_BITMAP + y * ROWBYTES + (x >> 1);
     uint8_t t;
+    uint8_t px[8];
     if (k == 0xFF) {
         // unknown character: draw black
         for (t = 0; t < 12; ++t) {
-            uint8_t i;
-            RIA.addr0 = addr;
-            RIA.step0 = 1;
-            for (i = 0; i < 8; ++i) RIA.rw0 = 0;
+            xram0_set(addr, 0, sizeof px);
             addr += ROWBYTES;
         }
         return;
@@ -103,16 +91,15 @@ static void draw_char(uint8_t ch, unsigned x, unsigned y, const uint8_t* nib) {
     for (t = 0; t < 12; ++t) {
         uint8_t b0 = rows[0], b1 = rows[1];
         rows += 2;
-        RIA.addr0 = addr;
-        RIA.step0 = 1;
-        RIA.rw0 = nib[(b0 >> 6) & 3];
-        RIA.rw0 = nib[(b0 >> 4) & 3];
-        RIA.rw0 = nib[(b0 >> 2) & 3];
-        RIA.rw0 = nib[b0 & 3];
-        RIA.rw0 = nib[(b1 >> 6) & 3];
-        RIA.rw0 = nib[(b1 >> 4) & 3];
-        RIA.rw0 = nib[(b1 >> 2) & 3];
-        RIA.rw0 = nib[b1 & 3];
+        px[0] = nib[(b0 >> 6) & 3];
+        px[1] = nib[(b0 >> 4) & 3];
+        px[2] = nib[(b0 >> 2) & 3];
+        px[3] = nib[b0 & 3];
+        px[4] = nib[(b1 >> 6) & 3];
+        px[5] = nib[(b1 >> 4) & 3];
+        px[6] = nib[(b1 >> 2) & 3];
+        px[7] = nib[b1 & 3];
+        xram0_write(addr, px, sizeof px);
         addr += ROWBYTES;
     }
 }
@@ -163,54 +150,39 @@ static void draw_score_line(void) {
 }
 
 static void clear_bitmap(void) {
-    unsigned i;
-    RIA.addr0 = XR_BITMAP;
-    RIA.step0 = 1;
-    for (i = 0; i < 38400u; ++i) RIA.rw0 = 0;
+    xram0_set(XRAM_BITMAP, 0, BITMAP_H * ROWBYTES);
 }
 
 static void park_sprites(void) {
     uint8_t i;
-    RIA.addr0 = XR_SPRITES;
-    RIA.step0 = 1;
     for (i = 0; i < NUM_SPRITES; ++i) {
-        RIA.rw0 = 0; RIA.rw0 = 0;            // x
-        RIA.rw0 = 0xF0; RIA.rw0 = 0xFF;      // y = -16
-        RIA.rw0 = (unsigned char)SPRITE_XRAM; RIA.rw0 = (unsigned char)(SPRITE_XRAM >> 8);
-        RIA.rw0 = (unsigned char)XR_SPAL; RIA.rw0 = (unsigned char)(XR_SPAL >> 8);
+        sprites[i].x_pos_px = 0;
+        sprites[i].y_pos_px = -16;
+        sprites[i].xram_sprite_ptr = XRAM_SPRITE_IMAGES;
+        sprites[i].palette_ptr = XRAM_SPRITE_PALETTES;
     }
+    xram0_write(XRAM_SPRITES, sprites, sizeof sprites);
 }
+
+static const mode3_config_t bitmap_config = {
+    false, false, 0, 0, BITMAP_W, BITMAP_H, XRAM_BITMAP, XRAM_BITMAP_PALETTE};
+
+// 0xFFFF selects the built-in palette and font.
+static const mode1_config_t text_config = {
+    false, false, 0, 0, TEXT_COLS, TEXT_ROWS, XRAM_TEXT, 0xFFFF, 0xFFFF};
 
 void video_init(void) {
     build_nibs();
     clear_bitmap();
     write_palettes();
     park_sprites();
-    // mode 3 config
-    RIA.addr0 = XR_CFG3;
-    RIA.step0 = 1;
-    RIA.rw0 = 0; RIA.rw0 = 0;
-    RIA.rw0 = 0; RIA.rw0 = 0;
-    RIA.rw0 = 0; RIA.rw0 = 0;
-    RIA.rw0 = 320 & 0xFF; RIA.rw0 = 320 >> 8;
-    RIA.rw0 = 240 & 0xFF; RIA.rw0 = 240 >> 8;
-    RIA.rw0 = XR_BITMAP & 0xFF; RIA.rw0 = XR_BITMAP >> 8;
-    RIA.rw0 = XR_BPAL & 0xFF; RIA.rw0 = XR_BPAL >> 8;
-    // mode 1 text config: 40x30, built in font/palette
-    RIA.addr0 = XR_CFG1;
-    RIA.rw0 = 0; RIA.rw0 = 0;
-    RIA.rw0 = 0; RIA.rw0 = 0;
-    RIA.rw0 = 0; RIA.rw0 = 0;
-    RIA.rw0 = TEXT_COLS; RIA.rw0 = 0;
-    RIA.rw0 = TEXT_ROWS; RIA.rw0 = 0;
-    RIA.rw0 = XR_TEXT & 0xFF; RIA.rw0 = XR_TEXT >> 8;
-    RIA.rw0 = 0xFF; RIA.rw0 = 0xFF;
-    RIA.rw0 = 0xFF; RIA.rw0 = 0xFF;
+    xram0_write(XRAM_BITMAP_CONFIG, &bitmap_config, sizeof bitmap_config);
+    xram0_write(XRAM_TEXT_CONFIG, &text_config, sizeof text_config);
     video_text_clear();
-    xreg_vga_canvas(1);
-    xreg_vga_mode(3, 2, XR_CFG3, 0, 0, 0);
-    xreg_vga_mode(5, 1 | (1 << 3), XR_SPRITES, NUM_SPRITES, 1, 0, 0);
-    xreg_vga_mode(1, 0, XR_CFG1, 2, 0, 0);
+    xreg_vga_canvas(CANVAS_320X240);
+    xreg_vga_mode3(MODE3_4BPP, XRAM_BITMAP_CONFIG, 0);
+    xreg_vga_mode5(MODE5_2BPP | MODE5_16X16, XRAM_SPRITES, NUM_SPRITES, 1);
+    xreg_vga_mode1(MODE1_1BPP | MODE1_8X8, XRAM_TEXT_CONFIG, 2);
     dirtyCount = 0;
     redrawAll = 1;
     scoreDirty = 1;
@@ -219,8 +191,8 @@ void video_init(void) {
 }
 
 void video_wait_vsync(void) {
-    unsigned char v = RIA.vsync;
-    while (RIA.vsync == v) {}
+    unsigned char v = ria_vsync();
+    while (ria_vsync() == v) {}
 }
 
 void video_dirty(uint8_t idx) {
@@ -248,7 +220,7 @@ void video_blank(uint8_t on) {
     if (on == blanked) return;
     blanked = on;
     // move the bitmap off screen (or back) and hide sprites
-    xram_write16(XR_CFG3 + 4, on ? 240 : 0);
+    xram0_poke16(XRAM_BITMAP_CONFIG + offsetof(mode3_config_t, y_pos_px), on ? BITMAP_H : 0);
     if (on) park_sprites();
 }
 
@@ -256,7 +228,6 @@ void video_blank(uint8_t on) {
 static void update_sprites(void) {
     uint8_t n = 0;
     uint8_t prior, i;
-    unsigned addr = XR_SPRITES;
     if (blanked) return;
     for (prior = 1; prior != 0xFF; --prior) {
         for (i = 0; i < 19; ++i) {
@@ -271,32 +242,24 @@ static void update_sprites(void) {
             if (slot == 0xFFFF) continue;
             pal = (uint8_t)(STMPPALW[s->ix >> 1] >> 5);
             if (s->cset == 1) pal = 8;
-            palp = XR_SPAL + (unsigned)pal * 8;
+            palp = XRAM_SPRITE_PALETTES + (unsigned)pal * sizeof palettes.sprites[0];
             sx = 32 + (int)s->x * 2;
             sy = TOP_BORDER + 203 - (int)s->y;
-            img = SPRITE_XRAM + slot * 64u;
+            img = XRAM_SPRITE_IMAGES + slot * sizeof(sprite_image_t);
             for (c = 0; c < chunks && n < NUM_SPRITES; ++c) {
-                RIA.addr0 = addr;
-                RIA.step0 = 1;
-                RIA.rw0 = (unsigned char)sx; RIA.rw0 = (unsigned char)(sx >> 8);
-                RIA.rw0 = (unsigned char)sy; RIA.rw0 = (unsigned char)(sy >> 8);
-                RIA.rw0 = (unsigned char)img; RIA.rw0 = (unsigned char)(img >> 8);
-                RIA.rw0 = (unsigned char)palp; RIA.rw0 = (unsigned char)(palp >> 8);
-                addr += 8;
+                sprites[n].x_pos_px = sx;
+                sprites[n].y_pos_px = sy;
+                sprites[n].xram_sprite_ptr = img;
+                sprites[n].palette_ptr = palp;
                 n++;
                 sx += 16;
-                img += 64;
+                img += sizeof(sprite_image_t);
             }
         }
     }
     // park the rest
-    while (n < NUM_SPRITES) {
-        RIA.addr0 = addr + 2;
-        RIA.step0 = 1;
-        RIA.rw0 = 0xF0; RIA.rw0 = 0xFF;
-        addr += 8;
-        n++;
-    }
+    while (n < NUM_SPRITES) sprites[n++].y_pos_px = -16;
+    xram0_write(XRAM_SPRITES, sprites, sizeof sprites);
 }
 
 void video_flush(void) {
@@ -325,16 +288,11 @@ void video_flush(void) {
 
 // ------------------------------------------------------------------ text --
 void video_text_clear(void) {
-    unsigned i;
-    RIA.addr0 = XR_TEXT;
-    RIA.step0 = 1;
-    for (i = 0; i < TEXT_COLS * TEXT_ROWS; ++i) RIA.rw0 = ' ';
+    xram0_set(XRAM_TEXT, ' ', TEXT_COLS * TEXT_ROWS);
 }
 
 void video_text(uint8_t col, uint8_t row, const char* s) {
-    RIA.addr0 = XR_TEXT + (unsigned)row * TEXT_COLS + col;
-    RIA.step0 = 1;
-    while (*s) RIA.rw0 = (unsigned char)*s++;
+    xram0_write(XRAM_TEXT + (unsigned)row * TEXT_COLS + col, s, strlen(s));
 }
 
 void video_text_num(uint8_t col, uint8_t row, uint32_t v, uint8_t width) {
